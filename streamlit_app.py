@@ -1,6 +1,6 @@
 # streamlit_app.py
 # Canvas Course-wide HTML Rewrite (Test Instance)
-# - Admin-only Streamlit app for dry-run + bulk apply on Pages & Assignment descriptions
+# - Admin-only Streamlit app for dry-run + bulk apply on Pages, Assignment descriptions, and Discussion topic descriptions
 # - Canvas API (test instance), OpenAI Responses API (auto-pick newest model + retries)
 # - Iframe freeze/restore (no new iframes), NO sanitizer (write model HTML as-is)
 # - Visual PREVIEW (Original vs Proposed) using a built-in DesignPLUS-like "Shim" (CSS+JS)
@@ -64,18 +64,26 @@ def find_course_by_code(account, course_code: str) -> List:
     matches = [c for c in courses if getattr(c, "course_code", "") == course_code]
     return matches if matches else list(courses)
 
-def list_supported_items(course, include_pages: bool = True, include_assignments: bool = True):
-    """Enumerate Module Items with optional type filtering."""
-    types = set()
+def list_supported_items(
+    course,
+    include_pages: bool = True,
+    include_assignments: bool = True,
+    include_discussions: bool = False
+):
+    """Enumerate Module Items with optional type filtering (Pages, Assignments, Discussions)."""
+    wanted = set()
     if include_pages:
-        types.add("Page")
+        wanted.add("Page")
     if include_assignments:
-        types.add("Assignment")
+        wanted.add("Assignment")
+    if include_discussions:
+        wanted.update({"Discussion", "DiscussionTopic"})  # tolerate naming variants
+
     supported = []
     for module in course.get_modules(include_items=True):
         items = list(module.get_module_items()) if not getattr(module, "items", None) else module.items
         for it in items:
-            if it.type in types:
+            if it.type in wanted:
                 supported.append((module, it))
     return supported
 
@@ -87,12 +95,26 @@ def fetch_item_html(course, item):
     elif item.type == "Assignment":
         asg = course.get_assignment(item.content_id)
         return {"kind": "Assignment", "id": asg.id, "title": asg.name, "html": asg.description or ""}
+    elif item.type in {"Discussion", "DiscussionTopic"}:
+        topic = course.get_discussion_topic(item.content_id)
+        return {
+            "kind": "Discussion",
+            "id": topic.id,
+            "title": getattr(topic, "title", f"Discussion {topic.id}"),
+            "html": getattr(topic, "message", "") or ""
+        }
 
 def apply_update(course, item, new_html: str):
     if item.type == "Page":
         course.get_page(item.page_url).edit(wiki_page={"body": new_html})
     elif item.type == "Assignment":
         course.get_assignment(item.content_id).edit(assignment={"description": new_html})
+    elif item.type in {"Discussion", "DiscussionTopic"}:
+        topic = course.get_discussion_topic(item.content_id)
+        try:
+            topic.edit(message=new_html)
+        except TypeError:
+            topic.edit(**{"message": new_html})
 
 # ---------------------- Iframe freeze/restore ----------------------
 
@@ -130,9 +152,7 @@ def strip_new_iframes(html: str) -> str:
 # ---------------------- Model-reference helpers ----------------------
 
 def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80) -> str:
-    """
-    Build a compact, valid-ish skeleton of the model HTML.
-    """
+    """Build a compact, valid-ish skeleton of the model HTML."""
     soup = BeautifulSoup(model_html or "", "html.parser")
 
     def keep_attr(k: str) -> bool:
@@ -150,7 +170,6 @@ def html_to_skeleton(model_html: str, max_nodes: int = 2000, max_text: int = 80)
         return (" " + " ".join(parts)) if parts else ""
 
     headings = {"h1","h2","h3","h4","h5","h6","summary","label"}
-
     count = [0]
 
     def render(node) -> str:
@@ -354,9 +373,7 @@ def openai_rewrite(
     model_text_id: str = DEFAULT_TEXT_MODEL,
     model_vision_id: str = DEFAULT_VISION_MODEL,
 ) -> str:
-    """
-    Call OpenAI Responses API to rewrite the HTML with precision directives and few-shot examples.
-    """
+    """Call OpenAI Responses API to rewrite the HTML with precision directives and few-shot examples."""
     policy = {
         "design_tools_mode": dt_mode,
         "allow_inline_styles": True,
@@ -411,7 +428,7 @@ def openai_rewrite(
             resp = _create_with_retries(
                 client=openai_client,
                 model=model_vision_id,
-                payload_input=payload,
+                payload_input=content_parts,
                 fallback_model="gpt-4o",
                 max_retries=3,
                 base_delay=1.0,
@@ -581,11 +598,7 @@ def preview_html_document(
     extra_css_texts: Optional[List[str]] = None,
     extra_js_texts: Optional[List[str]] = None,
 ) -> str:
-    """
-    Build a sandboxed preview document.
-    - Always includes our Shim CSS (and Shim JS if enabled).
-    - Optionally inlines uploaded CSS/JS for near-Canvas fidelity.
-    """
+    """Sandboxed preview document with shim and optional uploaded CSS/JS."""
     css_bundle = SHIM_CSS + "\n" + "\n".join(extra_css_texts or [])
     js_blocks = []
     if use_js_shim:
@@ -681,6 +694,7 @@ with st.sidebar:
         st.markdown("**Large course controls**")
         INCLUDE_PAGES = st.checkbox("Include Pages", value=True)
         INCLUDE_ASSIGNMENTS = st.checkbox("Include Assignments", value=True)
+        INCLUDE_DISCUSSIONS = st.checkbox("Include Discussions (topic descriptions)", value=True)
         BATCH_SIZE = st.number_input("Batch size (items per run)", 1, 200, 25, 1)
         TIME_BUDGET_MIN = st.number_input("Time budget (minutes, per run)", 1, 120, 10, 1)
         GENERATE_DIFFS = st.checkbox("Generate HTML diffs", value=True, help="Turn off to speed up on very large pages")
@@ -699,7 +713,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Model Reference (optional)")
-    ref_kind = st.radio("Reference type", ["None", "Paste HTML", "Upload Image", "Model Course"], horizontal=True)
+    ref_kind = st.radio("Reference type", ["None", "Paste HTML", "Upload Image"], horizontal=True)  # removed "Model Course"
 
     model_html_skeleton = None
     model_image_data_url = None
@@ -727,66 +741,6 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Failed to process image: {e}")
 
-    elif ref_kind == "Model Course":
-        st.caption("Use a Page or Assignment from another Canvas course as the model.")
-        mc_code = st.text_input("Model course code", key="model_course_code")
-        if st.button("Find model course"):
-            with st.spinner("Searching model course…"):
-                st.session_state["model_courses"] = find_single_course_by_code(account, mc_code)
-
-        model_courses = st.session_state.get("model_courses", [])
-        if model_courses:
-            m_idx = st.selectbox(
-                "Select model course",
-                options=list(range(len(model_courses))),
-                format_func=lambda i: f"{model_courses[i].id} · {getattr(model_courses[i], 'course_code', '')} · {getattr(model_courses[i], 'name', '')}",
-                key="model_course_idx"
-            )
-            model_course = model_courses[m_idx]
-            kind = st.radio("Model item type", ["Page", "Assignment"], horizontal=True, key="model_item_kind")
-
-            if kind == "Page":
-                if "model_pages" not in st.session_state:
-                    st.session_state["model_pages"] = list_all_pages(model_course)
-                if st.button("Refresh model pages"):
-                    st.session_state["model_pages"] = list_all_pages(model_course)
-                pages = st.session_state.get("model_pages", [])
-                if pages:
-                    page_map = {f"{t}": slug for (t, slug) in pages}
-                    sel_title = st.selectbox("Choose model page", options=list(page_map.keys()))
-                    if sel_title:
-                        try:
-                            raw = fetch_model_item_html(model_course, "Page", page_map[sel_title])
-                            model_html_skeleton = html_to_skeleton(raw)
-                            if len(model_html_skeleton) > MAX_MODEL_SKELETON_CHARS:
-                                model_html_skeleton = model_html_skeleton[:MAX_MODEL_SKELETON_CHARS] + " <!-- truncated -->"
-                            st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
-                            with st.expander("Preview model skeleton"):
-                                st.code(model_html_skeleton[:4000])
-                        except Exception as e:
-                            st.error(f"Failed to fetch model page: {e}")
-
-            else:
-                if "model_asgs" not in st.session_state:
-                    st.session_state["model_asgs"] = list_all_assignments(model_course)
-                if st.button("Refresh model assignments"):
-                    st.session_state["model_asgs"] = list_all_assignments(model_course)
-                asgs = st.session_state.get("model_asgs", [])
-                if asgs:
-                    asg_map = {f"{name} (#{aid})": aid for (name, aid) in asgs}
-                    sel_name = st.selectbox("Choose model assignment", options=list(asg_map.keys()))
-                    if sel_name:
-                        try:
-                            raw = fetch_model_item_html(model_course, "Assignment", asg_map[sel_name])
-                            model_html_skeleton = html_to_skeleton(raw)
-                            if len(model_html_skeleton) > MAX_MODEL_SKELETON_CHARS:
-                                model_html_skeleton = model_html_skeleton[:MAX_MODEL_SKELETON_CHARS] + " <!-- truncated -->"
-                            st.caption(f"Model skeleton length: {len(model_html_skeleton)} chars")
-                            with st.expander("Preview model skeleton"):
-                                st.code(model_html_skeleton[:4000])
-                        except Exception as e:
-                            st.error(f"Failed to fetch model assignment: {e}")
-
 st.subheader("1) Pick Course by Code")
 course_code = st.text_input("Course code", help="Exact course code preferred; we'll disambiguate if needed.")
 if st.button("Search course"):
@@ -807,7 +761,12 @@ if courses:
     # 2.1 Index items once (fast)
     if st.button("Index course items"):
         with st.spinner("Indexing module items…"):
-            idx_items = list_supported_items(course, include_pages=INCLUDE_PAGES, include_assignments=INCLUDE_ASSIGNMENTS)
+            idx_items = list_supported_items(
+                course,
+                include_pages=INCLUDE_PAGES,
+                include_assignments=INCLUDE_ASSIGNMENTS,
+                include_discussions=INCLUDE_DISCUSSIONS,
+            )
         st.session_state["index"] = idx_items
         st.session_state["offset"] = 0
         st.session_state.setdefault("items", [])
@@ -838,7 +797,6 @@ if courses:
         # 2.2 Process batch(es)
         if run_batch or run_all:
             start_time = time.time()
-            # define the range to process in this run
             to_process = range(offset, len(index)) if run_all else range(offset, min(offset + BATCH_SIZE, len(index)))
 
             progress = st.progress(0.0)
@@ -847,13 +805,11 @@ if courses:
             WINDOW = 5
             recent = []
 
-            # Ensure our collections exist
             st.session_state.setdefault("items", [])
             st.session_state.setdefault("drafts", {})
             st.session_state.setdefault("processed_keys", set())
 
             for i in to_process:
-                # Stop if we exceed the per-run time budget
                 if (time.time() - start_time) > (TIME_BUDGET_MIN * 60):
                     st.warning("Time budget reached; you can click 'Next' again to resume.")
                     break
@@ -864,7 +820,6 @@ if courses:
 
                 if key in st.session_state["processed_keys"]:
                     done += 1
-                    # update progress
                     denom = (len(index) - offset) if run_all else (min(offset + BATCH_SIZE, len(index)) - offset)
                     progress.progress(min(1.0, done / max(1, denom)))
                     continue
@@ -875,7 +830,6 @@ if courses:
                 prepped = frozen if len(frozen) <= MAX_INPUT_CHARS else (frozen[:MAX_INPUT_CHARS] + "\n<!-- truncated for prompt -->")
 
                 t0 = time.time()
-                # LLM call
                 try:
                     rewritten = openai_rewrite(
                         user_request=user_request,
@@ -888,11 +842,9 @@ if courses:
                         model_vision_id=MODEL_VISION,
                     )
                 except Exception as e:
-                    # Keep original when it fails, record error
                     rewritten = original
                     st.error(f"Rewrite failed for [{meta.get('title') or meta.get('url')}] — {e}")
 
-                # Strip any new iframes, then restore originals
                 rewritten_no_new_iframes = strip_new_iframes(rewritten)
                 final_html = restore_iframes(rewritten_no_new_iframes, mapping)
 
@@ -910,7 +862,6 @@ if courses:
                 st.session_state["drafts"][key] = {"diff": diff_html}
                 st.session_state["processed_keys"].add(key)
 
-                # Progress/ETA inside this run
                 duration = time.time() - t0
                 recent.append(duration)
                 if len(recent) > WINDOW:
@@ -922,7 +873,6 @@ if courses:
                 denom = (len(index) - offset) if run_all else (min(offset + BATCH_SIZE, len(index)) - offset)
                 progress.progress(min(1.0, done / max(1, denom)))
 
-            # Advance offset by # actually done this run
             st.session_state["offset"] = offset + done
             st.success(f"Batch complete. Total processed: {st.session_state['offset']} of {len(index)}.")
 
@@ -948,21 +898,20 @@ if courses:
         for _, rec in enumerate(items):
             cb_key = f"approve_{rec['key']}"
             with st.expander(f"[{rec['kind']}] {rec['title']} — {rec['module']}"):
-                # Visual previews (Original vs Proposed) using Shim + optional uploaded assets
                 left, right = st.columns(2)
                 with left:
                     st.markdown("**Original (visual)**")
                     original_preview = neutralize_iframes_for_preview(rec["original"])
                     st.components.v1.html(
-                        preview_html_document(original_preview, use_js_shim=True, extra_css_texts=extra_css_texts, extra_js_texts=extra_js_texts),
-                        height=520, scrolling=True
+                        preview_html_document(original_preview, use_js_shim=PREVIEW_JS, extra_css_texts=extra_css_texts, extra_js_texts=extra_js_texts),
+                        height=PREVIEW_HEIGHT, scrolling=True
                     )
                 with right:
                     st.markdown("**Proposed (visual)**")
                     proposed_preview = neutralize_iframes_for_preview(rec["draft"])
                     st.components.v1.html(
-                        preview_html_document(proposed_preview, use_js_shim=True, extra_css_texts=extra_css_texts, extra_js_texts=extra_js_texts),
-                        height=520, scrolling=True
+                        preview_html_document(proposed_preview, use_js_shim=PREVIEW_JS, extra_css_texts=extra_css_texts, extra_js_texts=extra_js_texts),
+                        height=PREVIEW_HEIGHT, scrolling=True
                     )
 
                 st.markdown("**Diff (proposed vs original)**  \n_Green = insertions, Red = deletions_")
