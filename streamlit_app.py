@@ -87,22 +87,113 @@ def list_supported_items(
                 supported.append((module, it))
     return supported
 
+def _normalized_item_kind(item_type: str) -> str:
+    return "Discussion" if item_type in {"Discussion", "DiscussionTopic"} else item_type
+
+
+def _item_cache_candidates(item) -> Tuple[str, List[str]]:
+    kind = _normalized_item_kind(item.type)
+    candidates: List[str] = []
+
+    content_id = getattr(item, "content_id", None)
+    if content_id:
+        candidates.append(f"{kind}:{content_id}")
+
+    page_id = getattr(item, "page_id", None)
+    if page_id:
+        candidates.append(f"{kind}:{page_id}")
+
+    page_url = getattr(item, "page_url", None)
+    if page_url:
+        candidates.append(f"{kind}@url:{page_url}")
+
+    module_item_id = getattr(item, "id", None)
+    if module_item_id:
+        candidates.append(f"ModuleItem:{module_item_id}")
+
+    deduped = []
+    seen = set()
+    for cand in candidates:
+        if cand not in seen:
+            seen.add(cand)
+            deduped.append(cand)
+    return kind, deduped
+
+
+def _get_item_cache_structures():
+    cache = st.session_state.setdefault("item_cache", {})
+    aliases = st.session_state.setdefault("item_cache_aliases", {})
+    return cache, aliases
+
+
+def _write_item_cache(meta: dict, candidates: List[str]):
+    cache, aliases = _get_item_cache_structures()
+    cache_key = f"{meta['kind']}:{meta['id']}"
+    cache[cache_key] = dict(meta)
+    aliases[cache_key] = cache_key
+    for cand in candidates:
+        aliases[cand] = cache_key
+    return cache_key
+
+
+def _cache_id_from_key(cache_key: str) -> str:
+    return cache_key.split(":", 1)[1] if ":" in cache_key else cache_key
+
+
+def _refresh_item_cache_from_record(record: dict, new_html: str):
+    meta = {
+        "kind": record["kind"],
+        "id": _cache_id_from_key(record["key"]),
+        "title": record.get("title"),
+        "html": new_html,
+    }
+
+    item = record.get("item")
+    if record["kind"] == "Page" and item is not None:
+        page_url = getattr(item, "page_url", None)
+        if page_url:
+            meta["url"] = page_url
+
+    if item is not None:
+        _, candidates = _item_cache_candidates(item)
+    else:
+        candidates = []
+
+    _write_item_cache(meta, candidates)
+
+
 def fetch_item_html(course, item):
-    """Fetch the HTML-bearing body for a supported item."""
-    if item.type == "Page":
+    """Fetch the HTML-bearing body for a supported item with session cache."""
+    cache, aliases = _get_item_cache_structures()
+
+    kind, candidates = _item_cache_candidates(item)
+    for cand in candidates:
+        if cand in cache:
+            return dict(cache[cand])
+        mapped = aliases.get(cand)
+        if mapped and mapped in cache:
+            return dict(cache[mapped])
+
+    if kind == "Page":
         page = course.get_page(item.page_url)
-        return {"kind": "Page", "id": page.page_id, "url": page.url, "title": page.title, "html": page.body or ""}
-    elif item.type == "Assignment":
+        meta = {"kind": "Page", "id": page.page_id, "url": page.url, "title": page.title, "html": page.body or ""}
+    elif kind == "Assignment":
         asg = course.get_assignment(item.content_id)
-        return {"kind": "Assignment", "id": asg.id, "title": asg.name, "html": asg.description or ""}
-    elif item.type in {"Discussion", "DiscussionTopic"}:
+        meta = {"kind": "Assignment", "id": asg.id, "title": asg.name, "html": asg.description or ""}
+    elif kind == "Discussion":
         topic = course.get_discussion_topic(item.content_id)
-        return {
+        meta = {
             "kind": "Discussion",
             "id": topic.id,
             "title": getattr(topic, "title", f"Discussion {topic.id}"),
             "html": getattr(topic, "message", "") or ""
         }
+    else:
+        meta = {"kind": kind, "id": getattr(item, "content_id", getattr(item, "id", "unknown")), "html": ""}
+
+    _write_item_cache(meta, candidates)
+
+    return dict(meta)
 
 def apply_update(course, item, new_html: str):
     if item.type == "Page":
@@ -935,6 +1026,7 @@ if courses:
                         continue
                     try:
                         apply_update(course, rec["item"], rec["draft"])
+                        _refresh_item_cache_from_record(rec, rec["draft"])
                         applied += 1
                     except Exception as e:
                         failed += 1
