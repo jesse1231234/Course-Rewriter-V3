@@ -358,22 +358,57 @@ def image_to_data_url(file) -> Tuple[str, str]:
 
 # ---------------------- Auto-pick newest model ----------------------
 
+def _client_token_fingerprint(client: OpenAI) -> str:
+    token = getattr(client, "api_key", None) or getattr(client, "_api_key", None)
+    if token:
+        return sha256(str(token))
+    env_token = os.getenv("OPENAI_API_KEY", "")
+    return sha256(env_token) if env_token else "anon"
+
+
+def _model_record(model) -> Optional[dict]:
+    if model is None:
+        return None
+    if isinstance(model, dict):
+        model_id = model.get("id")
+        created = model.get("created", 0)
+    else:
+        model_id = getattr(model, "id", None)
+        created = getattr(model, "created", 0)
+    if not model_id:
+        return None
+    return {"id": model_id, "created": created}
+
+
+@st.cache_data(show_spinner=False, hash_funcs={OpenAI: lambda client: _client_token_fingerprint(client)})
 def list_models(client: OpenAI):
     try:
         res = client.models.list()
         data = getattr(res, "data", res)
-        return list(data)
+        serialized = []
+        for entry in data:
+            record = _model_record(entry)
+            if record:
+                serialized.append(record)
+        return serialized
     except Exception:
         return []
 
-def latest_model_id(client: OpenAI, pattern: str, default_id: str) -> str:
-    models = list_models(client)
+
+def latest_model_id(
+    client: OpenAI,
+    pattern: str,
+    default_id: str,
+    models: Optional[List[dict]] = None,
+) -> str:
+    if models is None:
+        models = list_models(client)
     try:
-        matches = [m for m in models if re.search(pattern, m.id)]
+        matches = [m for m in models if re.search(pattern, m.get("id", ""))]
         if not matches:
             return default_id
-        matches.sort(key=lambda m: getattr(m, "created", 0), reverse=True)
-        return matches[0].id
+        matches.sort(key=lambda m: m.get("created", 0), reverse=True)
+        return matches[0]["id"]
     except Exception:
         return default_id
 
@@ -792,10 +827,24 @@ with st.sidebar:
 
     st.markdown("---")
     st.subheader("Model")
+    if st.button("Refresh model list", type="secondary", help="Clear the cached model listing and fetch the latest models on next use."):
+        list_models.clear()
+        st.success("Model list cache cleared. Fetching latest models…")
     mode = st.radio("Model selection", ["Auto (latest)", "Manual"], horizontal=True)
     if mode == "Auto (latest)":
-        MODEL_TEXT = latest_model_id(openai_client, r"^(gpt-5|gpt-4\.1|gpt-4o|o\d)", DEFAULT_TEXT_MODEL)
-        MODEL_VISION = latest_model_id(openai_client, r"^(gpt-5|gpt-4o|gpt-4\.1|o\d)", DEFAULT_VISION_MODEL)
+        available_models = list_models(openai_client)
+        MODEL_TEXT = latest_model_id(
+            openai_client,
+            r"^(gpt-5|gpt-4\.1|gpt-4o|o\d)",
+            DEFAULT_TEXT_MODEL,
+            models=available_models,
+        )
+        MODEL_VISION = latest_model_id(
+            openai_client,
+            r"^(gpt-5|gpt-4o|gpt-4\.1|o\d)",
+            DEFAULT_VISION_MODEL,
+            models=available_models,
+        )
     else:
         MODEL_TEXT = st.text_input("Text model id", value=DEFAULT_TEXT_MODEL)
         MODEL_VISION = st.text_input("Vision model id", value=DEFAULT_VISION_MODEL)
